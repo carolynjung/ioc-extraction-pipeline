@@ -1,0 +1,134 @@
+name: IOC Pipeline CI
+
+# Trigger conditions for the workflow to run
+# - push to main: validates code quality on every commit
+# - pull_request to main: catches issues before merge
+# - schedule: runs the pipeline daily to keep ioc data fresh
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Daily at 06:00 UTC
+    # Cron format: minute hour day-of-month month day-of-week
+    - cron: "0 6 * * *"
+
+jobs:
+  # Lint
+  # Runs on every trigger (push, PR, schedule)i.e. in parallel not dependent
+  # pass before the pipeline job is allowed to run
+  lint:
+    name: Lint and type check
+    runs-on: ubuntu-latest
+
+    # Least-privilege permissions — lint only can read the repo
+    # Explicitly scoped to prevent writing or creation
+    # with the broad GITHUB_TOKEN perms
+    permissions:
+      contents: read
+
+    steps:
+      # Clone the repos onto the runner.
+      # Pinned to commit SHA instead of @v4 tag 
+      # prevent redirection to malicious code because tags are mutable 
+      # uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4
+
+      # Install Python version of project
+      # Pinned to SHA instead of @v5 tag
+      # uses: actions/setup-python@v5
+      - name: Set up Python 3.11
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b  # v5
+        with:
+          python-version: "3.11"
+
+      # |->  multi-line string
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install flake8 mypy
+
+      # flake8: enforces PEP 8 style rules;catches common errors
+      # --max-line-length=100;default has 79-char limit 
+      # to accommodate longer variable names 
+      - name: Run flake8 (style lint)
+        run: flake8 src/ cli.py --max-line-length=100
+
+      # mypy: static type checker;catches type mismatches before runtime
+      # --ignore-missing-imports skips errors for third-party libraries
+      # that don't ship type stubs (e.g. requests).
+      - name: Run mypy (type check)
+        run: mypy src/ --ignore-missing-imports
+
+  # Pipeline
+  # Runs only after lint passes (needs: lint).
+  # Skipped on pull requests; no automated commits on PRs,
+  # only on direct pushes to main and scheduled runs
+  pipeline:
+    name: Run pipeline and commit output
+    runs-on: ubuntu-latest
+    needs: lint
+
+    # contents: write is required only for this job because it commits
+    # fresh IOC output back to the repository.
+    # Scoped here rather than at workflow level so the lint job stays read-only.
+    permissions:
+      contents: write
+
+    # PRs excluded to prevent committing ioc data on unmerged branches 
+    # Also to prevent triggering looping of workflow run
+    # Fresh data should only be comittied 
+    # i.e. on scheduled runs and pushes to main
+    if: github.event_name == 'schedule' || github.event_name == 'push'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b  # v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # API keys are stored in GitHub repository Secrets
+      # (Settings>Secrets and variables>Actions)
+      # injected as env vars at runtime; not written to workflow nor logs
+      # TODO: add feeds
+      # run: python cli.py --feeds urlhaus threatfox feodotracker --output data/output/
+      - name: Run IOC pipeline
+        env:
+          OTX_API_KEY: ${{ secrets.OTX_API_KEY }}
+          ABUSEIPDB_API_KEY: ${{ secrets.ABUSEIPDB_API_KEY }}
+        run: python cli.py --feeds urlhaus --output data/output/
+
+      # Commit and push fresh IOC output using only native git commands
+      # No third-party actions such as with linting
+      # to eliminate risks with dependency on third-parties 
+      # Esp with single maintainer code
+      #
+      # Steps:
+      # Configure git identity for the automated commit
+      # Stage only the IOC output files (not the full working tree)
+      # Check for staged changes before committing 
+      #    if feeds returned identical data to the previous run, skip the commit
+      #    don't creat an empty noise commit
+      #    'git diff --staged --quiet' exits 0 (no changes) or 1 (changes)
+      #    || operator runs the right side only when the left side
+      #    exits non-zero aka run only when there are changes to commit.
+      # Push the commit back to main using the built-in GITHUB_TOKEN
+      #
+      # [skip ci] - tag to prevent another trigger workflow run 
+      # else an infinite push -> pipeline -> push loop
+      # chore meaning maintenance
+      - name: Commit and push IOC output
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/output/*.json data/output/*.csv
+          git diff --staged --quiet || git commit -m "chore: automated IOC pipeline run [skip ci]"
+          git push
